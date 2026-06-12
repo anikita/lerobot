@@ -19,7 +19,7 @@ import os
 from importlib.resources import files
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import TypedDict, TypeVar, Unpack
+from typing import Any, TypedDict, TypeVar, Unpack
 
 import packaging
 import safetensors
@@ -153,6 +153,10 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
         """
         The policy is set in evaluation mode by default using `policy.eval()` (dropout modules are
         deactivated). To train it, you should first set it back in training mode with `policy.train()`.
+
+        If ``revision="latest-checkpoint"`` and the branch doesn't exist (e.g., first training run
+        before any checkpoint has been pushed), config loading falls back to main via
+        ``PreTrainedConfig.from_pretrained``, and model weights fall back below.
         """
         if config is None:
             config = PreTrainedConfig.from_pretrained(
@@ -173,11 +177,12 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
             model_file = os.path.join(model_id, SAFETENSORS_SINGLE_FILE)
             policy = cls._load_as_safetensor(instance, model_file, config.device, strict)
         else:
+            model_revision = revision
             try:
                 model_file = hf_hub_download(
                     repo_id=model_id,
                     filename=SAFETENSORS_SINGLE_FILE,
-                    revision=revision,
+                    revision=model_revision,
                     cache_dir=cache_dir,
                     force_download=force_download,
                     proxies=proxies,
@@ -186,10 +191,28 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
                     local_files_only=local_files_only,
                 )
                 policy = cls._load_as_safetensor(instance, model_file, config.device, strict)
-            except HfHubHTTPError as e:
-                raise FileNotFoundError(
-                    f"{SAFETENSORS_SINGLE_FILE} not found on the HuggingFace Hub in {model_id}"
-                ) from e
+            except HfHubHTTPError:
+                if model_revision == "latest-checkpoint":
+                    logging.info(
+                        "latest-checkpoint branch not found, falling back to main."
+                    )
+                    model_revision = "main"
+                    model_file = hf_hub_download(
+                        repo_id=model_id,
+                        filename=SAFETENSORS_SINGLE_FILE,
+                        revision=model_revision,
+                        cache_dir=cache_dir,
+                        force_download=force_download,
+                        proxies=proxies,
+                        resume_download=resume_download,
+                        token=token,
+                        local_files_only=local_files_only,
+                    )
+                    policy = cls._load_as_safetensor(instance, model_file, config.device, strict)
+                else:
+                    raise FileNotFoundError(
+                        f"{SAFETENSORS_SINGLE_FILE} not found on the HuggingFace Hub in {model_id}"
+                    )
 
         policy.to(config.device)
         policy.eval()
@@ -270,42 +293,60 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
         self,
         cfg: TrainPipelineConfig,
         peft_model=None,
+        revision: str | None = None,
     ):
         api = HfApi()
         repo_id = api.create_repo(
             repo_id=self.config.repo_id, private=self.config.private, exist_ok=True
         ).repo_id
 
+        # Create the target branch if it doesn't exist yet (required by preupload endpoint)
+        if revision:
+            api.create_branch(repo_id, branch=revision, exist_ok=True)
+
         # Push the files to the repo in a single commit
         with TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             saved_path = Path(tmp) / repo_id
 
             if peft_model is not None:
-                # Since PEFT just forwards calls to `push_model_to_hub`, `self` is not the PeftModel wrapper
-                # but the actual policy which is why we need the PEFT model passed to us to save the adapter.
-                # That also means that we need to store the policy config ourselves since PEFT can't.
                 peft_model.save_pretrained(saved_path)
                 self.config.save_pretrained(saved_path)
             else:
-                self.save_pretrained(saved_path)  # Calls _save_pretrained and stores model tensors
+                self.save_pretrained(saved_path)
 
             card = self.generate_model_card(
                 cfg.dataset.repo_id, self.config.type, self.config.license, self.config.tags, cfg=cfg
             )
             card.save(str(saved_path / "README.md"))
 
-            cfg.save_pretrained(saved_path)  # Calls _save_pretrained and stores train config
+            cfg.save_pretrained(saved_path)
 
+            commit_message = (
+                f"Checkpoint at {revision}" if revision
+                else "Upload policy weights, train config and readme"
+            )
             commit_info = api.upload_folder(
                 repo_id=repo_id,
                 repo_type="model",
                 folder_path=saved_path,
-                commit_message="Upload policy weights, train config and readme",
+                revision=revision,
+                commit_message=commit_message,
                 allow_patterns=["*.safetensors", "*.json", "*.yaml", "*.md"],
                 ignore_patterns=["*.tmp", "*.log"],
             )
 
-            logging.info(f"Model pushed to {commit_info.repo_url.url}")
+            revision_info = f" [revision={revision}]" if revision else ""
+            logging.info(f"Model pushed to {commit_info.repo_url.url}{revision_info}")
+
+            # Update latest-checkpoint pointer to this revision
+            # (delete + create — create_branch with exist_ok=True won't update an existing ref)
+            if revision:
+                try:
+                    api.delete_branch(repo_id, branch="latest-checkpoint")
+                except HfHubHTTPError:
+                    pass  # doesn't exist yet (first checkpoint push)
+                api.create_branch(repo_id, branch="latest-checkpoint", revision=revision)
+                logging.info(f"latest-checkpoint pointer updated → {revision}")
 
     def generate_model_card(
         self,

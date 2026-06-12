@@ -69,6 +69,8 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):  # type: igno
 
     push_to_hub: bool = True  # type: ignore[assignment] # TODO: use a different name to avoid override
     repo_id: str | None = None
+    # Whether to push intermediate checkpoints to Hub at each save_freq interval during training.
+    push_checkpoints_to_hub: bool = False
 
     # Upload on private repository on the Hugging Face hub.
     private: bool | None = None
@@ -79,6 +81,8 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):  # type: igno
     # Either the repo ID of a model hosted on the Hub or a path to a directory containing weights
     # saved using `Policy.save_pretrained`. If not provided, the policy is initialized from scratch.
     pretrained_path: Path | None = None
+    # HuggingFace Hub revision (commit hash, branch, or tag) for loading a specific version.
+    revision: str | None = None
 
     def __post_init__(self) -> None:
         if not self.device or not is_torch_device_available(self.device):
@@ -198,10 +202,31 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):  # type: igno
                     token=token,
                     local_files_only=local_files_only,
                 )
-            except HfHubHTTPError as e:
-                raise FileNotFoundError(
-                    f"{CONFIG_NAME} not found on the HuggingFace Hub in {model_id}"
-                ) from e
+            except HfHubHTTPError:
+                if revision is not None:
+                    logger.warning(
+                        f"{revision} branch not found for {model_id}, falling back to main."
+                    )
+                    try:
+                        config_file = hf_hub_download(
+                            repo_id=model_id,
+                            filename=CONFIG_NAME,
+                            revision=None,
+                            cache_dir=cache_dir,
+                            force_download=force_download,
+                            proxies=proxies,
+                            resume_download=resume_download,
+                            token=token,
+                            local_files_only=local_files_only,
+                        )
+                    except HfHubHTTPError as e2:
+                        raise FileNotFoundError(
+                            f"{CONFIG_NAME} not found on the HuggingFace Hub in {model_id}"
+                        ) from e2
+                else:
+                    raise FileNotFoundError(
+                        f"{CONFIG_NAME} not found on the HuggingFace Hub in {model_id}"
+                    )
 
         # HACK: Parse the original config to get the config subclass, so that we can
         # apply cli overrides.
@@ -223,4 +248,7 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):  # type: igno
 
         cli_overrides = policy_kwargs.pop("cli_overrides", [])
         with draccus.config_type("json"):
-            return draccus.parse(orig_config.__class__, config_file, args=cli_overrides)
+            config = draccus.parse(orig_config.__class__, config_file, args=cli_overrides)
+        if revision:
+            config.revision = revision
+        return config

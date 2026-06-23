@@ -123,7 +123,7 @@ class ACTPolicy(PreTrainedPolicy):
         return self._action_queue.popleft()
 
     @torch.no_grad()
-    def predict_action_chunk(self, batch: dict[str, Tensor]) -> Tensor:
+    def predict_action_chunk(self, batch: dict[str, Tensor], **kwargs) -> Tensor:
         """Predict a chunk of actions given environment observations."""
         self.eval()
 

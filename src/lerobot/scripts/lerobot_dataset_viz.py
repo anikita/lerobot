@@ -172,6 +172,19 @@ def visualize_dataset(
             if "next.success" in batch:
                 rr.log("next.success", rr.Scalars(batch["next.success"][i].item()))
 
+            # display any additional scalar features (e.g. q_target, intervention)
+            known_keys = {ACTION, OBS_STATE, DONE, REWARD, "next.success"}
+            known_keys.update(dataset.meta.camera_keys)
+            for key in batch:
+                if key in known_keys or key in ("index", "timestamp", "episode_index", "frame_index", "task_index", "task"):
+                    continue
+                val = batch[key][i]
+                try:
+                    scalar = float(val.item() if hasattr(val, 'item') else val)
+                    rr.log(key, rr.Scalars(scalar))
+                except (TypeError, ValueError, AttributeError):
+                    pass  # skip non-scalar features (vectors, images)
+
     if mode == "local" and save:
         # save .rrd locally
         output_dir = Path(output_dir)

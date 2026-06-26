@@ -1,0 +1,25 @@
+# Upstream base: 6f0ba4be3853b773ad2e8887be2761bc5474fc89 (huggingface/lerobot:main, 2026-06-26)
+diff --git a/src/lerobot/scripts/lerobot_dataset_viz.py b/src/lerobot/scripts/lerobot_dataset_viz.py
+index d07a2767..c2d4b764 100644
+--- a/src/lerobot/scripts/lerobot_dataset_viz.py
++++ b/src/lerobot/scripts/lerobot_dataset_viz.py
+@@ -172,6 +172,19 @@ def visualize_dataset(
+             if "next.success" in batch:
+                 rr.log("next.success", rr.Scalars(batch["next.success"][i].item()))
+ 
++            # display any additional scalar features (e.g. q_target, intervention)
++            known_keys = {ACTION, OBS_STATE, DONE, REWARD, "next.success"}
++            known_keys.update(dataset.meta.camera_keys)
++            for key in batch:
++                if key in known_keys or key in ("index", "timestamp", "episode_index", "frame_index", "task_index", "task"):
++                    continue
++                val = batch[key][i]
++                try:
++                    scalar = float(val.item() if hasattr(val, 'item') else val)
++                    rr.log(key, rr.Scalars(scalar))
++                except (TypeError, ValueError, AttributeError):
++                    pass  # skip non-scalar features (vectors, images)
++
+     if mode == "local" and save:
+         # save .rrd locally
+         output_dir = Path(output_dir)

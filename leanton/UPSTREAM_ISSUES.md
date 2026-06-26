@@ -26,3 +26,4 @@
 | [#3459](https://github.com/huggingface/lerobot/issues/3459) | PEFT resume silently discards loaded adapter (double wrap) | 2026-05-04 | bug, configuration, dataset, policies, training | `fdbfc015` — same commit, same root cause |
 | [#3551](https://github.com/huggingface/lerobot/issues/3551) | PeftConfig missing `lora_alpha` field — defaults to 8, dampens high-rank LoRA | 2026-05-13 | bug, configuration, policies, training | `9db9c35c` — fix(config): add lora_alpha to PeftConfig |
 | [#3723](https://github.com/huggingface/lerobot/issues/3723) | SO-101 DAGGER: bumpless transfer on pause (sync leader to follower) | 2026-06-09 | enhancement, policies | [#3506](https://github.com/huggingface/lerobot/pull/3506) — feat(dagger): adding smooth handover |
+| [dataset-viz-generic-scalars](https://github.com/huggingface/lerobot/issues/3880) | Feature request: render all scalar columns generically | 2026-06-26 | Open |

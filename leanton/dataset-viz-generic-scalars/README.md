@@ -2,7 +2,7 @@
 
 **Target:** `src/lerobot/scripts/lerobot_dataset_viz.py`
 **Status:** `active`
-**GitHub:** Not filed
+**GitHub:** [#3880](https://github.com/huggingface/lerobot/issues/3880)
 **Diff basis:** `origin/main` @ `6f0ba4be` (clean upstream, 2026-06-26)
 
 ## What

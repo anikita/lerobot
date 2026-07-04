@@ -177,3 +177,7 @@ outputs/
 *.xml
 *.part
 *.bak
+
+# ── leanton: volatile directories outside leanton/ ──
+patches/
+vla_so101_pick_n_place_full_expert/

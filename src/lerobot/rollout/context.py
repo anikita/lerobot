@@ -280,11 +280,20 @@ def build_rollout_context(
     # ``observation_features`` values are either a tuple (camera shape) or the
     # ``float`` type itself used as a sentinel for scalar motor features —
     # see ``dict[str, type | tuple]`` annotation on ``Robot.observation_features``.
-    observation_features_hw = {
-        k: v
-        for k, v in all_obs_features.items()
-        if isinstance(v, tuple) or (v is float and k.endswith(".pos"))
+    #
+    # Non-3-element tuples (e.g. ``target_coord_mm: (2,)``) are sensor
+    # vectors — they are split out and added as individual dataset features
+    # below, outside the state vector.
+    cam_features_hw = {
+        k: v for k, v in all_obs_features.items() if isinstance(v, tuple) and len(v) == 3
     }
+    motor_features_hw = {
+        k: v for k, v in all_obs_features.items() if v is float and k.endswith(".pos")
+    }
+    sensor_features_hw = {
+        k: v for k, v in all_obs_features.items() if isinstance(v, tuple) and len(v) != 3
+    }
+    observation_features_hw = {**motor_features_hw, **cam_features_hw}
     action_features_hw = {k: v for k, v in robot.action_features.items() if k.endswith(".pos")}
 
     # The action side is always needed: sync inference reads action names from
@@ -301,6 +310,15 @@ def build_rollout_context(
         use_videos=cfg.dataset.video if cfg.dataset else True,
     )
     dataset_features = combine_feature_dicts(action_dataset_features, observation_dataset_features)
+    # Inject sensor vector features (non-camera tuples) as individual
+    # dataset columns — they don't belong in ``observation.state`` because
+    # the policy's normalizer stats don't include them.
+    for key, shape in sensor_features_hw.items():
+        dataset_features[f"observation.{key}"] = {
+            "dtype": "int64",
+            "shape": shape,
+            "names": None,
+        }
     hw_features = hw_to_dataset_features(observation_features_hw, "observation")
     raw_action_keys = list(action_features_hw.keys())
     policy_action_names = getattr(policy_config, "action_feature_names", None)

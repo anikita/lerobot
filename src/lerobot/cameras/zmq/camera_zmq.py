@@ -102,6 +102,7 @@ class ZMQCamera(Camera):
         self.frame_lock: Lock = Lock()
         self.latest_frame: NDArray[Any] | None = None
         self.latest_timestamp: float | None = None
+        self.latest_metadata: dict[str, Any] = {}
         self.new_frame_event: Event = Event()
 
     def __str__(self) -> str:
@@ -194,6 +195,14 @@ class ZMQCamera(Camera):
         if "images" not in data:
             raise RuntimeError(f"{self} invalid message: missing 'images' key")
 
+        # Store any extra metadata fields (non-image, non-timestamp) for
+        # downstream consumers. The read-loop copies this under lock. This
+        # is the gate for ZMQ publishers that enrich frames with sensor
+        # data — e.g. calibrated coordinates, gripper state, confidence.
+        self._raw_metadata = {
+            k: v for k, v in data.items() if k not in ("timestamps", "images")
+        }
+
         images = data["images"]
 
         # Get image by camera name or first available
@@ -258,6 +267,7 @@ class ZMQCamera(Camera):
                 with self.frame_lock:
                     self.latest_frame = frame
                     self.latest_timestamp = capture_time
+                    self.latest_metadata = getattr(self, "_raw_metadata", {}).copy()
                 self.new_frame_event.set()
                 failure_count = 0
 
@@ -279,6 +289,7 @@ class ZMQCamera(Camera):
         with self.frame_lock:
             self.latest_frame = None
             self.latest_timestamp = None
+            self.latest_metadata = {}
             self.new_frame_event.clear()
 
         self.stop_event = Event()
@@ -369,6 +380,21 @@ class ZMQCamera(Camera):
 
         return frame
 
+    @check_if_not_connected
+    def read_metadata(self) -> dict[str, Any]:
+        """Return the latest non-image metadata from the ZMQ message.
+
+        ZMQ publishers may enrich frames with extra JSON fields (e.g.
+        ``target_coord_mm``, ``status``, sensor readings).  This method
+        exposes those fields without changing the Camera interface.
+
+        Returns:
+            dict: A copy of the latest metadata dict (thread-safe).
+                  Empty dict if the publisher sends no extra fields.
+        """
+        with self.frame_lock:
+            return dict(self.latest_metadata)
+
     def disconnect(self) -> None:
         """Disconnect from ZMQ camera."""
         if not self.is_connected and self.thread is None:
@@ -382,6 +408,7 @@ class ZMQCamera(Camera):
         with self.frame_lock:
             self.latest_frame = None
             self.latest_timestamp = None
+            self.latest_metadata = {}
             self.new_frame_event.clear()
 
         logger.info(f"{self} disconnected.")

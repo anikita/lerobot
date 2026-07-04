@@ -18,6 +18,8 @@ import logging
 import time
 from functools import cached_property
 
+import numpy as np
+
 from lerobot.cameras import make_cameras_from_configs
 from lerobot.motors import Motor, MotorCalibration, MotorNormMode
 from lerobot.motors.feetech import (
@@ -67,6 +69,17 @@ class SOFollower(Robot):
         return {f"{motor}.pos": float for motor in self.bus.motors}
 
     @property
+    def _sensor_ft(self) -> dict[str, tuple]:
+        """Non-camera, non-motor observation features.
+
+        Populated from ZMQ camera metadata (e.g. calibrated target
+        coordinates).  Declared as shape tuples (not ``float``) so they
+        become individual dataset features instead of being bundled into
+        ``observation.state``.
+        """
+        return {"target_coord_mm": (2,)}
+
+    @property
     def _cameras_ft(self) -> dict[str, tuple]:
         return {
             cam: (self.config.cameras[cam].height, self.config.cameras[cam].width, 3) for cam in self.cameras
@@ -74,7 +87,7 @@ class SOFollower(Robot):
 
     @cached_property
     def observation_features(self) -> dict[str, type | tuple]:
-        return {**self._motors_ft, **self._cameras_ft}
+        return {**self._motors_ft, **self._sensor_ft, **self._cameras_ft}
 
     @cached_property
     def action_features(self) -> dict[str, type]:
@@ -189,6 +202,28 @@ class SOFollower(Robot):
             obs_dict[cam_key] = cam.read_latest()
             dt_ms = (time.perf_counter() - start) * 1e3
             logger.debug(f"{self} read {cam_key}: {dt_ms:.1f}ms")
+
+        # Pick up ZMQ metadata (e.g. calibrated target coordinates) from
+        # the first camera that publishes it.  Non-ZMQ cameras and ZMQ
+        # streams without metadata contribute nothing.
+        target_coord_mm = None
+        for cam in self.cameras.values():
+            reader = getattr(cam, "read_metadata", None)
+            if reader is not None:
+                try:
+                    meta = reader()
+                except Exception:
+                    continue
+                if "target_coord_mm" in meta:
+                    target_coord_mm = meta["target_coord_mm"]
+                    break
+
+        if target_coord_mm is not None and len(target_coord_mm) >= 2:
+            obs_dict["target_coord_mm"] = np.array(
+                [target_coord_mm[0], target_coord_mm[1]], dtype=np.int64
+            )
+        else:
+            obs_dict["target_coord_mm"] = np.array([0, 0], dtype=np.int64)
 
         return obs_dict
 

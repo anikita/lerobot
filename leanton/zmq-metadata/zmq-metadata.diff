@@ -1,0 +1,205 @@
+# Upstream base: 6f0ba4be3853b773ad2e8887be2761bc5474fc89 (huggingface/lerobot:main, 2026-07)
+diff --git a/src/lerobot/cameras/zmq/camera_zmq.py b/src/lerobot/cameras/zmq/camera_zmq.py
+index f3df1781..c78a5575 100644
+--- a/src/lerobot/cameras/zmq/camera_zmq.py
++++ b/src/lerobot/cameras/zmq/camera_zmq.py
+@@ -102,6 +102,7 @@ class ZMQCamera(Camera):
+         self.frame_lock: Lock = Lock()
+         self.latest_frame: NDArray[Any] | None = None
+         self.latest_timestamp: float | None = None
++        self.latest_metadata: dict[str, Any] = {}
+         self.new_frame_event: Event = Event()
+ 
+     def __str__(self) -> str:
+@@ -194,6 +195,14 @@ class ZMQCamera(Camera):
+         if "images" not in data:
+             raise RuntimeError(f"{self} invalid message: missing 'images' key")
+ 
++        # Store any extra metadata fields (non-image, non-timestamp) for
++        # downstream consumers. The read-loop copies this under lock. This
++        # is the gate for ZMQ publishers that enrich frames with sensor
++        # data — e.g. calibrated coordinates, gripper state, confidence.
++        self._raw_metadata = {
++            k: v for k, v in data.items() if k not in ("timestamps", "images")
++        }
++
+         images = data["images"]
+ 
+         # Get image by camera name or first available
+@@ -259,6 +268,7 @@ class ZMQCamera(Camera):
+                 with self.frame_lock:
+                     self.latest_frame = frame
+                     self.latest_timestamp = capture_time
++                    self.latest_metadata = getattr(self, "_raw_metadata", {}).copy()
+                 self.new_frame_event.set()
+                 failure_count = 0
+ 
+@@ -280,6 +290,7 @@ class ZMQCamera(Camera):
+         with self.frame_lock:
+             self.latest_frame = None
+             self.latest_timestamp = None
++            self.latest_metadata = {}
+             self.new_frame_event.clear()
+ 
+         self.stop_event = Event()
+@@ -370,6 +381,21 @@ class ZMQCamera(Camera):
+ 
+         return frame
+ 
++    @check_if_not_connected
++    def read_metadata(self) -> dict[str, Any]:
++        """Return the latest non-image metadata from the ZMQ message.
++
++        ZMQ publishers may enrich frames with extra JSON fields (e.g.
++        ``target_coord_mm``, ``status``, sensor readings).  This method
++        exposes those fields without changing the Camera interface.
++
++        Returns:
++            dict: A copy of the latest metadata dict (thread-safe).
++                  Empty dict if the publisher sends no extra fields.
++        """
++        with self.frame_lock:
++            return dict(self.latest_metadata)
++
+     def disconnect(self) -> None:
+         """Disconnect from ZMQ camera."""
+         if not self.is_connected and self.thread is None:
+@@ -383,6 +409,7 @@ class ZMQCamera(Camera):
+         with self.frame_lock:
+             self.latest_frame = None
+             self.latest_timestamp = None
++            self.latest_metadata = {}
+             self.new_frame_event.clear()
+ 
+         logger.info(f"{self} disconnected.")
+diff --git a/src/lerobot/robots/so_follower/so_follower.py b/src/lerobot/robots/so_follower/so_follower.py
+index 0651f566..00943d0e 100644
+--- a/src/lerobot/robots/so_follower/so_follower.py
++++ b/src/lerobot/robots/so_follower/so_follower.py
+@@ -18,6 +18,8 @@ import logging
+ import time
+ from functools import cached_property
+ 
++import numpy as np
++
+ from lerobot.cameras import make_cameras_from_configs
+ from lerobot.motors import Motor, MotorCalibration, MotorNormMode
+ from lerobot.motors.feetech import (
+@@ -66,6 +68,17 @@ class SOFollower(Robot):
+     def _motors_ft(self) -> dict[str, type]:
+         return {f"{motor}.pos": float for motor in self.bus.motors}
+ 
++    @property
++    def _sensor_ft(self) -> dict[str, tuple]:
++        """Non-camera, non-motor observation features.
++
++        Populated from ZMQ camera metadata (e.g. calibrated target
++        coordinates).  Declared as shape tuples (not ``float``) so they
++        become individual dataset features instead of being bundled into
++        ``observation.state``.
++        """
++        return {"target_coord_mm": (2,)}
++
+     @property
+     def _cameras_ft(self) -> dict[str, tuple]:
+         return {
+@@ -74,7 +87,7 @@ class SOFollower(Robot):
+ 
+     @cached_property
+     def observation_features(self) -> dict[str, type | tuple]:
+-        return {**self._motors_ft, **self._cameras_ft}
++        return {**self._motors_ft, **self._sensor_ft, **self._cameras_ft}
+ 
+     @cached_property
+     def action_features(self) -> dict[str, type]:
+@@ -190,6 +203,28 @@ class SOFollower(Robot):
+             dt_ms = (time.perf_counter() - start) * 1e3
+             logger.debug(f"{self} read {cam_key}: {dt_ms:.1f}ms")
+ 
++        # Pick up ZMQ metadata (e.g. calibrated target coordinates) from
++        # the first camera that publishes it.  Non-ZMQ cameras and ZMQ
++        # streams without metadata contribute nothing.
++        target_coord_mm = None
++        for cam in self.cameras.values():
++            reader = getattr(cam, "read_metadata", None)
++            if reader is not None:
++                try:
++                    meta = reader()
++                except Exception:
++                    continue
++                if "target_coord_mm" in meta:
++                    target_coord_mm = meta["target_coord_mm"]
++                    break
++
++        if target_coord_mm is not None and len(target_coord_mm) >= 2:
++            obs_dict["target_coord_mm"] = np.array(
++                [target_coord_mm[0], target_coord_mm[1]], dtype=np.int64
++            )
++        else:
++            obs_dict["target_coord_mm"] = np.array([0, 0], dtype=np.int64)
++
+         return obs_dict
+ 
+     @check_if_not_connected
+diff --git a/src/lerobot/rollout/context.py b/src/lerobot/rollout/context.py
+index bf5fa0fd..e86cff8e 100644
+--- a/src/lerobot/rollout/context.py
++++ b/src/lerobot/rollout/context.py
+@@ -276,11 +276,20 @@ def build_rollout_context(
+     # ``observation_features`` values are either a tuple (camera shape) or the
+     # ``float`` type itself used as a sentinel for scalar motor features —
+     # see ``dict[str, type | tuple]`` annotation on ``Robot.observation_features``.
+-    observation_features_hw = {
+-        k: v
+-        for k, v in all_obs_features.items()
+-        if isinstance(v, tuple) or (v is float and k.endswith(".pos"))
++    #
++    # Non-3-element tuples (e.g. ``target_coord_mm: (2,)``) are sensor
++    # vectors — they are split out and added as individual dataset features
++    # below, outside the state vector.
++    cam_features_hw = {
++        k: v for k, v in all_obs_features.items() if isinstance(v, tuple) and len(v) == 3
+     }
++    motor_features_hw = {
++        k: v for k, v in all_obs_features.items() if v is float and k.endswith(".pos")
++    }
++    sensor_features_hw = {
++        k: v for k, v in all_obs_features.items() if isinstance(v, tuple) and len(v) != 3
++    }
++    observation_features_hw = {**motor_features_hw, **cam_features_hw}
+     action_features_hw = {k: v for k, v in robot.action_features.items() if k.endswith(".pos")}
+ 
+     # The action side is always needed: sync inference reads action names from
+@@ -297,6 +306,15 @@ def build_rollout_context(
+         use_videos=cfg.dataset.video if cfg.dataset else True,
+     )
+     dataset_features = combine_feature_dicts(action_dataset_features, observation_dataset_features)
++    # Inject sensor vector features (non-camera tuples) as individual
++    # dataset columns — they don't belong in ``observation.state`` because
++    # the policy's normalizer stats don't include them.
++    for key, shape in sensor_features_hw.items():
++        dataset_features[f"observation.{key}"] = {
++            "dtype": "int64",
++            "shape": shape,
++            "names": None,
++        }
+     hw_features = hw_to_dataset_features(observation_features_hw, "observation")
+     raw_action_keys = list(action_features_hw.keys())
+     policy_action_names = getattr(policy_config, "action_feature_names", None)
+diff --git a/src/lerobot/utils/feature_utils.py b/src/lerobot/utils/feature_utils.py
+index 2a488623..1d249711 100644
+--- a/src/lerobot/utils/feature_utils.py
++++ b/src/lerobot/utils/feature_utils.py
+@@ -121,6 +121,12 @@ def build_dataset_frame(
+             frame[key] = np.array([values[name] for name in ft["names"]], dtype=np.float32)
+         elif ft["dtype"] in ["image", "video"]:
+             frame[key] = values[key.removeprefix(f"{prefix}.images.")]
++        elif ft.get("names") is None:
++            # Individual scalar/vector feature (not bundled into state vector).
++            # The feature key suffix (e.g. "target_coord_mm") is the lookup
++            # key in ``values``.
++            suffix = key.removeprefix(f"{prefix}.")
++            frame[key] = np.array(values[suffix], dtype=ft["dtype"])
+ 
+     return frame
+ 

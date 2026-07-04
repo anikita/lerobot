@@ -121,6 +121,12 @@ def build_dataset_frame(
             frame[key] = np.array([values[name] for name in ft["names"]], dtype=np.float32)
         elif ft["dtype"] in ["image", "video"]:
             frame[key] = values[key.removeprefix(f"{prefix}.images.")]
+        elif ft.get("names") is None:
+            # Individual scalar/vector feature (not bundled into state vector).
+            # The feature key suffix (e.g. "target_coord_mm") is the lookup
+            # key in ``values``.
+            suffix = key.removeprefix(f"{prefix}.")
+            frame[key] = np.array(values[suffix], dtype=ft["dtype"])
 
     return frame
 

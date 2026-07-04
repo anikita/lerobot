@@ -4,5 +4,14 @@ __pycache__/
 *.pt
 *.onnx
 .DS_Store
+# Generated runtime/config files
 annotate_stream_state*.json
 annotate_stream_multi_state*.json
+calibration_points.json
+homography_calibration.json
+_test_calibration.json
+calibration_markers.pdf
+# Backups
+*.bak
+*.bak.*
+archive/

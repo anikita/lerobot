@@ -46,6 +46,7 @@ Controls:
     S   — save snapshot of active stream pane
     Z   — define pick zone (detect streams only)
     X   — define exclusion zone (detect streams only)
+    H   — toggle calibrated coordinate overlay (detect streams only)
     Q   — quit (auto-saves state)
 
 State file: annotate_stream_multi_state.json (multi-stream format).
@@ -112,7 +113,7 @@ DEFAULT_CAMERAS    = "0,2,"       # overview=/dev/video0, wrist=/dev/video2, pat
 DEFAULT_ZMQ_PORTS  = "5555,5556,5557"
 DEFAULT_ZMQ_NAMES  = "annotated,wrist,target_patch"
 DEFAULT_ZMQ_RES    = "640x480,640x480,640x480"
-DEFAULT_CAPTURE_RES = "1024x768,640x480,"  # empty for patch (no camera)
+DEFAULT_CAPTURE_RES = ",,"  # empty = let V4L2 choose native resolution; empty for patch (no camera)
 DEFAULT_PATCH_SOURCES = ",,0"     # patch derives from stream 0 (overview)
 
 # ── Bounding-box expansion ────────────────────────────────────
@@ -173,7 +174,7 @@ def setup_zmq(port):
     return ctx, sock
 
 
-def zmq_publish(sock, camera_name, frame_bgr, quality=ZMQ_JPEG_QUALITY, timestamp=None):
+def zmq_publish(sock, camera_name, frame_bgr, quality=ZMQ_JPEG_QUALITY, timestamp=None, extra_fields=None):
     """Encode frame as JPEG and publish in LeRobot ZMQCamera wire format.
 
     ZMQCamera decodes with cv2.imdecode (returns BGR) but performs no
@@ -188,14 +189,49 @@ def zmq_publish(sock, camera_name, frame_bgr, quality=ZMQ_JPEG_QUALITY, timestam
     _, jpg = cv2.imencode(".jpg", frame_rgb, [cv2.IMWRITE_JPEG_QUALITY, quality])
     encoded = base64.b64encode(jpg).decode("utf-8")
     ts = timestamp if timestamp is not None else time.monotonic()
-    msg = json.dumps({
+    msg_dict = {
         "timestamps": {camera_name: ts},
         "images":     {camera_name: encoded},
-    })
+    }
+    if extra_fields:
+        msg_dict.update(extra_fields)
+    msg = json.dumps(msg_dict)
     try:
         sock.send_string(msg, zmq.NOBLOCK)
     except zmq.Again:
         pass   # no subscriber yet — drop silently, never block the main loop
+
+
+# ── Frame preprocessing ───────────────────────────────────────────────────────
+
+def crop_to_aspect(frame, target_w, target_h):
+    """Center-crop `frame` to match the aspect ratio of (target_w, target_h),
+    then resize uniformly to (target_w, target_h).
+
+    No stretching — the image is cropped to the target aspect ratio first,
+    preserving pixel proportions. Different cameras with different native
+    aspect ratios all produce the same output shape with no distortion.
+    """
+    fh, fw = frame.shape[:2]
+    target_ar = target_w / target_h
+    source_ar = fw / fh
+
+    if abs(source_ar - target_ar) < 0.01:
+        # Aspect ratio already matches — uniform resize only
+        return cv2.resize(frame, (target_w, target_h))
+
+    if source_ar > target_ar:
+        # Source is wider — crop left/right
+        new_w = int(fh * target_ar)
+        offset = (fw - new_w) // 2
+        cropped = frame[:, offset:offset + new_w]
+    else:
+        # Source is taller — crop top/bottom
+        new_h = int(fw / target_ar)
+        offset = (fh - new_h) // 2
+        cropped = frame[offset:offset + new_h, :]
+
+    return cv2.resize(cropped, (target_w, target_h))
 
 
 # ── Camera ────────────────────────────────────────────────────────────────────
@@ -236,9 +272,13 @@ def _open_camera_raw(idx, width=640, height=480):
     return cap
 
 
-def open_camera(idx, width=640, height=480):
-    """Open camera for sustained capture."""
-    return _open_camera_raw(idx, width, height)
+def open_camera(idx, width=None, height=None):
+    """Open camera for sustained capture.
+    If width/height are None, V4L2 chooses the camera's native resolution.
+    """
+    w = width if width is not None else 1920  # request high; V4L2 clamps to max
+    h = height if height is not None else 1080
+    return _open_camera_raw(idx, w, h)
 
 
 def probe_max_capture_res(cap, current_w=640, current_h=480):
@@ -362,9 +402,107 @@ def save_state(streams):
             entry["frozen"] = s.frozen
             entry["frozen_bbox"] = list(s.frozen_bbox) if s.frozen_bbox else None
             entry["frozen_label"] = s.frozen_label if s.frozen else ""
+            entry["h_active"] = s.h_active
             print(f"[save_state] {s.cfg.name}: classes={entry['classes']}")
         data["streams"][s.cfg.name] = entry
     STATE_FILE.write_text(json.dumps(data, indent=2))
+
+
+# ── Calibration ────────────────────────────────────────────────────────────────
+
+CALIBRATION_FILE = Path(__file__).with_name("homography_calibration.json")
+
+
+def load_calibration():
+    """Load planar homography from homography_calibration.json.
+
+    Returns (H, calib_data) where H is a 3×3 np.float32 matrix, or (None, None)
+    if the file is missing, malformed, or fails validation.
+    """
+    if not CALIBRATION_FILE.exists():
+        print("[annotator] homography_calibration.json not found — "
+              "coordinate transform disabled. Run calibrate_homography.py first.")
+        return None, None
+
+    try:
+        calib = json.loads(CALIBRATION_FILE.read_text())
+    except json.JSONDecodeError as e:
+        print(f"[annotator] homography_calibration.json is malformed ({e}) — "
+              "coordinate transform disabled.")
+        return None, None
+
+    # Validate
+    if not isinstance(calib, dict) or calib.get("version") != 1:
+        print("[annotator] homography_calibration.json: unknown version — "
+              "coordinate transform disabled.")
+        return None, None
+
+    H_list = calib.get("homography_matrix")
+    if H_list is None or len(H_list) != 3 or any(len(row) != 3 for row in H_list):
+        print("[annotator] homography_calibration.json: invalid homography_matrix — "
+              "coordinate transform disabled.")
+        return None, None
+
+    H = np.array(H_list, dtype=np.float32)
+
+    cam_w = calib.get("camera_resolution", [0, 0])[0]
+    cam_h = calib.get("camera_resolution", [0, 0])[1]
+    print(f"[annotator] Calibration loaded: {calib.get('date', 'unknown date')}, "
+          f"camera {calib.get('camera', '?')}, "
+          f"resolution {cam_w}x{cam_h}, "
+          f"reproj error {calib.get('reprojection_error_rms_mm', '?')} mm")
+    return H, calib
+
+
+def zmq_to_source(cx_zmq, cy_zmq, zmq_w, zmq_h, src_w, src_h):
+    """Map a point from ZMQ-resolution coordinates to source (capture) coordinates.
+
+    Reverses the center-crop + uniform resize applied by crop_to_aspect().
+    Returns (cx_src, cy_src) as floats.
+    """
+    target_ar = zmq_w / zmq_h
+    source_ar = src_w / src_h
+
+    if abs(source_ar - target_ar) < 0.01:
+        crop_w, crop_h = src_w, src_h
+        crop_left, crop_top = 0, 0
+    elif source_ar > target_ar:
+        crop_h = src_h
+        crop_w = int(crop_h * target_ar)
+        crop_left = (src_w - crop_w) // 2
+        crop_top = 0
+    else:
+        crop_w = src_w
+        crop_h = int(crop_w / target_ar)
+        crop_left = 0
+        crop_top = (src_h - crop_h) // 2
+
+    cx_src = crop_left + cx_zmq * (crop_w / zmq_w)
+    cy_src = crop_top  + cy_zmq * (crop_h / zmq_h)
+    return cx_src, cy_src
+
+
+def pixel_to_robot(cx_zmq, cy_zmq, H, zmq_w, zmq_h,
+                   src_w, src_h, calib_w, calib_h):
+    """Project a bbox center (ZMQ-resolution pixels) to robot-base mm.
+
+    Pipeline:
+      1. ZMQ pixel -> source pixel  (undo crop_to_aspect via zmq_to_source)
+      2. source pixel -> calibration pixel (scale to calibration resolution)
+      3. Project through H
+
+    H was calibrated at calib_w × calib_h (from homography_calibration.json).
+    src_w × src_h is the actual camera capture resolution.
+    zmq_w × zmq_h is the ZMQ stream resolution.
+    """
+    cx_src, cy_src = zmq_to_source(cx_zmq, cy_zmq, zmq_w, zmq_h, src_w, src_h)
+    cx_calib = cx_src * (calib_w / src_w)
+    cy_calib = cy_src * (calib_h / src_h)
+    pts = np.array([[[cx_calib, cy_calib]]], dtype=np.float32)
+    projected = cv2.perspectiveTransform(pts, H)
+    x_mm = round(float(projected[0][0][0]))
+    y_mm = round(float(projected[0][0][1]))
+    return (x_mm, y_mm)
 
 
 # ── Model ─────────────────────────────────────────────────────────────────────
@@ -488,7 +626,7 @@ def _draw_dashed_rect(frame, x1, y1, x2, y2, color, label):
         cv2.line(frame, (x1, i), (x1, min(i + 8, y2)), color, 1)
         cv2.line(frame, (x2, i), (x2, min(i + 8, y2)), color, 1)
     cv2.putText(frame, label, (x1 + 4, y1 + 16),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
+                cv2.FONT_HERSHEY_SIMPLEX, 0.52, color, 1)
 
 
 def draw_zone_overlays(frame, pick_zone, excl_zone):
@@ -764,7 +902,7 @@ def draw_annotated_stream(frame, bbox, buf, frozen):
 
 # ── Drawing: operator HUD ─────────────────────────────────────────────────────
 
-def draw_target_hud(frame, bbox, label, conf, buf, frozen):
+def draw_target_hud(frame, bbox, label, conf, buf, frozen, stream=None):
     """Operator overlay — bbox with label and coordinate readout."""
     if bbox is None or not (frozen or buf.is_stable):
         return
@@ -773,17 +911,28 @@ def draw_target_hud(frame, bbox, label, conf, buf, frozen):
     x1, y1, x2, y2 = bbox
     cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3)
     text_y = y1 - 10 if y1 > 25 else y2 + 20
-    cv2.putText(frame, tag, (x1, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.50, color, 1)
+    cv2.putText(frame, tag, (x1, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.57, color, 1)
+
+    # ── Coordinate overlay (H-transform active + frozen) ──
+    if stream is not None and frozen and stream.h_active and stream.frozen_coord_mm is not None:
+        coord_str = f"({stream.frozen_coord_mm[0]}, {stream.frozen_coord_mm[1]}) mm"
+        coord_y = text_y - 22 if text_y > 40 else y2 + 42
+        # White text with black outline for contrast
+        cv2.putText(frame, coord_str, (x1, coord_y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.63, (0, 0, 0), 3)
+        cv2.putText(frame, coord_str, (x1, coord_y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.63, (255, 255, 255), 1)
+
     cv2.putText(frame, f"bbox [{x1},{y1},{x2},{y2}]",
                 (10, frame.shape[0] - 50),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.48, color, 1)
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 1)
 
 
 def draw_secondary(frame, detections):
     for _, x1, y1, x2, y2, label, conf in detections[1:]:
         cv2.rectangle(frame, (x1, y1), (x2, y2), (80, 80, 80), 1)
         cv2.putText(frame, f"{label} ({conf:.0%})", (x1, y1 - 6),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (80, 80, 80), 1)
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.57, (80, 80, 80), 1)
 
 
 def draw_stability_bar(frame, buf, frozen):
@@ -810,7 +959,7 @@ def draw_stability_bar(frame, buf, frozen):
     if fill_px > 0:
         cv2.rectangle(frame, (bx, by), (bx + fill_px, by + bar_h), fill_color, -1)
     cv2.rectangle(frame, (bx, by), (bx + bar_w, by + bar_h), (120, 120, 120), 1)
-    cv2.putText(frame, label, (bx, by - 3), cv2.FONT_HERSHEY_SIMPLEX, 0.38, fill_color, 1)
+    cv2.putText(frame, label, (bx, by - 3), cv2.FONT_HERSHEY_SIMPLEX, 0.44, fill_color, 1)
 
 
 def draw_detect_hud(frame, stream, detections, fps, device):
@@ -820,38 +969,50 @@ def draw_detect_hud(frame, stream, detections, fps, device):
     cv2.rectangle(frame, (0, 0), (w, 38), (20, 20, 20), -1)
     mode_label = "[ FROZEN ]  YOLO-World" if stream.frozen else f"YOLO-World ({device})"
     mode_color = COLOR_FROZEN if stream.frozen else COLOR_RUNNING
-    cv2.putText(frame, mode_label, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.55, mode_color, 1)
+    cv2.putText(frame, mode_label, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.63, mode_color, 1)
     cv2.putText(frame, f"{fps:.1f} fps  |  proc:{stream.proc_ms:.0f}ms",
-                (w - 260, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
-    cv2.putText(frame, stream.info_str, (10, 72), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (220, 220, 220), 1)
+                (w - 260, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.57, (200, 200, 200), 1)
+    cv2.putText(frame, stream.info_str, (10, 72), cv2.FONT_HERSHEY_SIMPLEX, 0.63, (220, 220, 220), 1)
     if stream.show_all:
-        cv2.putText(frame, "[ALL]", (w - 60, 72), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 0), 1)
+        cv2.putText(frame, "[ALL]", (w - 60, 72), cv2.FONT_HERSHEY_SIMPLEX, 0.57, (200, 200, 0), 1)
+
+    # H-transform indicator
+    h_x = w - 130 if stream.show_all else w - 90
+    if stream.frozen and stream.h_active and stream.frozen_coord_mm is not None:
+        cv2.putText(frame, f"H:({stream.frozen_coord_mm[0]},{stream.frozen_coord_mm[1]})",
+                    (h_x, 72), cv2.FONT_HERSHEY_SIMPLEX, 0.52, COLOR_FROZEN, 1)
+    elif hasattr(stream, 'calibration_loaded') and not stream.calibration_loaded:
+        cv2.putText(frame, "H: N/A", (h_x, 72),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.52, (100, 100, 100), 1)
+    elif stream.h_active:
+        cv2.putText(frame, "H: ON", (h_x, 72),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.52, (180, 220, 255), 1)
 
     # Camera indicator
     if stream.cfg.camera_idx is not None:
         cam_str = f"CAM [{stream.cfg.camera_idx}]"
-        cv2.putText(frame, cam_str, (10, h - 28), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 220, 255), 1)
+        cv2.putText(frame, cam_str, (10, h - 28), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (180, 220, 255), 1)
 
 
 def draw_passthrough_hud(frame, stream, fps):
     """Minimal HUD for passthrough-mode streams."""
     h, w = frame.shape[:2]
     cv2.rectangle(frame, (0, 0), (w, 38), (20, 20, 20), -1)
-    cv2.putText(frame, "PASSTHROUGH", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.55, COLOR_RUNNING, 1)
+    cv2.putText(frame, "PASSTHROUGH", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.63, COLOR_RUNNING, 1)
     cv2.putText(frame, f"{fps:.1f} fps  |  proc:{stream.proc_ms:.0f}ms",
-                (w - 260, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+                (w - 260, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.57, (200, 200, 200), 1)
     if stream.cfg.camera_idx is not None:
         cam_str = f"CAM [{stream.cfg.camera_idx}]"
-        cv2.putText(frame, cam_str, (10, h - 28), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 220, 255), 1)
+        cv2.putText(frame, cam_str, (10, h - 28), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (180, 220, 255), 1)
 
 
 def draw_patch_hud(frame, stream, fps):
     """Bare HUD for patch-mode streams — label only."""
     h, w = frame.shape[:2]
     cv2.rectangle(frame, (0, 0), (w, 38), (20, 20, 20), -1)
-    cv2.putText(frame, "PATCH", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.55, COLOR_FROZEN, 1)
+    cv2.putText(frame, "PATCH", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.63, COLOR_FROZEN, 1)
     cv2.putText(frame, f"{fps:.1f} fps  |  proc:{stream.proc_ms:.0f}ms",
-                (w - 260, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+                (w - 260, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.57, (200, 200, 200), 1)
 
 
 # ── Stream dataclasses ────────────────────────────────────────────────────────
@@ -904,6 +1065,14 @@ class StreamState:
     frozen_label: str = ""
     frozen_conf: float = 0.0
     passthrough_active: bool = False       # runtime toggle (P key) on detect streams
+    # ── H-transform (calibrated coordinates) ──
+    h_active: bool = False                 # H key toggle
+    calibration_loaded: bool = False       # True if homography_calibration.json loaded successfully
+    frozen_bbox_center: tuple | None = None  # (cx, cy) of frozen bbox in ZMQ-resolution pixels
+    frozen_coord_mm: tuple | None = None     # (x_mm, y_mm) projected through homography, rounded to int
+    _H_scaled: object | None = None        # 3×3 homography at camera resolution
+    _calib_cam_w: int = 0                  # calibration camera resolution width
+    _calib_cam_h: int = 0                  # calibration camera resolution height
     show_raw: bool = False
     show_all: bool = False
     selected_det_idx: int | None = None
@@ -960,7 +1129,7 @@ def build_composite(streams, shared_top_bar=""):
 
     # ── Shared top bar ──
     cv2.rectangle(canvas, (0, 0), (common_w, top_bar_h), (30, 30, 30), -1)
-    cv2.putText(canvas, shared_top_bar, (10, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+    cv2.putText(canvas, shared_top_bar, (10, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.57, (200, 200, 200), 1)
 
     y = top_bar_h
 
@@ -985,7 +1154,7 @@ def build_composite(streams, shared_top_bar=""):
             label_color = (200, 150, 0)  # amber
         else:
             label_color = (200, 200, 200)
-        cv2.putText(canvas, label_text, (6, y + 18), cv2.FONT_HERSHEY_SIMPLEX, 0.42, label_color, 1)
+        cv2.putText(canvas, label_text, (6, y + 18), cv2.FONT_HERSHEY_SIMPLEX, 0.48, label_color, 1)
         y += 26
 
         # Pane
@@ -999,8 +1168,8 @@ def build_composite(streams, shared_top_bar=""):
 
     # ── Hint bar ──
     cv2.rectangle(canvas, (0, y), (common_w, y + hint_bar_h), (30, 30, 30), -1)
-    hint = "TAB=cycle stream  |  Q=quit  P=passthrough  F=freeze  []=cycle  C=cam  A=all  R=raw  S=snap  Z=pick-zone  X=excl-zone"
-    cv2.putText(canvas, hint, (10, y + 17), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (120, 120, 120), 1)
+    hint = "TAB=cycle stream  |  Q=quit  P=passthrough  F=freeze  []=cycle  C=cam  A=all  R=raw  S=snap  Z=pick-zone  X=excl-zone  H=coord"
+    cv2.putText(canvas, hint, (10, y + 17), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (120, 120, 120), 1)
 
     return canvas
 
@@ -1017,18 +1186,14 @@ def process_stream(stream, streams, shared_model, no_zmq):
             # Camera failure — reopen
             stream.cap.release()
             stream.cap = open_camera(stream.cfg.camera_idx,
-                                     stream.cfg.capture_width or 640,
-                                     stream.cfg.capture_height or 480)
+                                     stream.cfg.capture_width,
+                                     stream.cfg.capture_height)
             if stream.cap is None:
                 return  # skip this iteration
             return  # try again next frame
 
         stream.capture_frame_hi = frame_hi
-        h, w = frame_hi.shape[:2]
-        if (w, h) != (stream.cfg.zmq_width, stream.cfg.zmq_height):
-            frame = cv2.resize(frame_hi, (stream.cfg.zmq_width, stream.cfg.zmq_height))
-        else:
-            frame = frame_hi
+        frame = crop_to_aspect(frame_hi, stream.cfg.zmq_width, stream.cfg.zmq_height)
 
         # ── Detection ──
         if stream.passthrough_active:
@@ -1077,9 +1242,13 @@ def process_stream(stream, streams, shared_model, no_zmq):
             output = draw_annotated_stream(frame, median_bbox, stream.buf, frozen=False)
 
         # ── ZMQ publish ──
+        zmq_extra = None
+        if stream.frozen and stream.h_active and stream.frozen_coord_mm is not None:
+            zmq_extra = {"target_coord_mm": list(stream.frozen_coord_mm), "status": "FROZEN"}
         if not no_zmq and stream.zmq_sock is not None:
             ts = time.monotonic()
-            zmq_publish(stream.zmq_sock, stream.cfg.zmq_camera_name, output, timestamp=ts)
+            zmq_publish(stream.zmq_sock, stream.cfg.zmq_camera_name, output, timestamp=ts,
+                        extra_fields=zmq_extra)
             stream.last_publish_monotonic = ts
 
         # ── Build display ──
@@ -1094,11 +1263,13 @@ def process_stream(stream, streams, shared_model, no_zmq):
                 else:
                     median_bbox = stream.buf.median()
                 draw_target_hud(display, median_bbox, stream.frozen_label, stream.frozen_conf,
-                                stream.buf, stream.frozen)
+                                stream.buf, stream.frozen, stream=stream)
 
             # Info string
             if stream.frozen:
-                stream.info_str = f"FROZEN  bbox {stream.frozen_bbox}"
+                coord_str = f"  ({stream.frozen_coord_mm[0]}, {stream.frozen_coord_mm[1]}) mm" \
+                    if stream.h_active and stream.frozen_coord_mm is not None else ""
+                stream.info_str = f"FROZEN  bbox {stream.frozen_bbox}{coord_str}"
             elif stream.buf.in_hysteresis:
                 remaining = HYSTERESIS_SECS - (time.monotonic() - stream.buf._last_valid_at)
                 stream.info_str = f"Holding committed target — releasing in {remaining:.0f}s"
@@ -1138,10 +1309,8 @@ def process_stream(stream, streams, shared_model, no_zmq):
                 return
             return
 
-        # Resize if capture dims differ from ZMQ dims
-        h, w = frame.shape[:2]
-        if (w, h) != (stream.cfg.zmq_width, stream.cfg.zmq_height):
-            frame = cv2.resize(frame, (stream.cfg.zmq_width, stream.cfg.zmq_height))
+        # Crop-to-aspect + uniform resize to ZMQ dims
+        frame = crop_to_aspect(frame, stream.cfg.zmq_width, stream.cfg.zmq_height)
 
         if not no_zmq and stream.zmq_sock is not None:
             ts = time.monotonic()
@@ -1166,11 +1335,12 @@ def process_stream(stream, streams, shared_model, no_zmq):
                 # just clamps to the real frame edge, leaving empty space
                 # below. Scaling from the actual array we crop fixes both.
                 hi_h, hi_w = source.capture_frame_hi.shape[:2]
-                sx = hi_w / source.cfg.zmq_width
-                sy = hi_h / source.cfg.zmq_height
                 bx1, by1, bx2, by2 = source.frozen_bbox
-                cx1 = int(bx1 * sx); cy1 = int(by1 * sy)
-                cx2 = int(bx2 * sx); cy2 = int(by2 * sy)
+                # Map ZMQ bbox corners to source (capture) coords — reverses crop_to_aspect
+                cx1, cy1 = zmq_to_source(bx1, by1, source.cfg.zmq_width, source.cfg.zmq_height, hi_w, hi_h)
+                cx2, cy2 = zmq_to_source(bx2, by2, source.cfg.zmq_width, source.cfg.zmq_height, hi_w, hi_h)
+                cx1, cy1 = int(cx1), int(cy1)
+                cx2, cy2 = int(cx2), int(cy2)
                 # Crop preserving the object's natural aspect ratio, then
                 # letterbox onto a black output-size canvas. Replaces the old
                 # "force square + resize" path, which (a) squashed the object
@@ -1247,6 +1417,8 @@ def dispatch_key(key_ext, key_ascii, target, streams, available_cams, no_zmq):
             s.frozen_bbox = None
             s.frozen_label = ""
             s.frozen_conf = 0.0
+            s.frozen_bbox_center = None
+            s.frozen_coord_mm = None
             s.buf.hard_reset()
             s.selected_det_idx = None
             save_state(streams)
@@ -1258,11 +1430,50 @@ def dispatch_key(key_ext, key_ascii, target, streams, available_cams, no_zmq):
                 s.frozen_bbox = m
                 s.frozen_label = s.buf.label
                 s.frozen_conf = getattr(s, 'frozen_conf', 0.0)
+                # Compute bbox center and coordinate if H is active
+                x1, y1, x2, y2 = m
+                s.frozen_bbox_center = ((x1 + x2) // 2, (y1 + y2) // 2)
+                if s.h_active and hasattr(s, '_H_scaled') and s._H_scaled is not None:
+                    s.frozen_coord_mm = pixel_to_robot(
+                        s.frozen_bbox_center[0], s.frozen_bbox_center[1],
+                        s._H_scaled, s.cfg.zmq_width, s.cfg.zmq_height,
+                        s.actual_capture_w, s.actual_capture_h,
+                        s._calib_cam_w, s._calib_cam_h)
+                else:
+                    s.frozen_coord_mm = None
                 save_state(streams)
-                print(f"[{s.cfg.name}] Frozen: {s.frozen_bbox}  label={s.frozen_label}  State saved.")
+                coord_info = f"  coord={s.frozen_coord_mm} mm" if s.frozen_coord_mm else ""
+                print(f"[{s.cfg.name}] Frozen: {s.frozen_bbox}  label={s.frozen_label}{coord_info}  State saved.")
             else:
                 print(f"[{s.cfg.name}] Nothing to freeze — no stable detection yet.")
         s.selected_det_idx = None
+
+    # ── H-transform toggle (detect streams only) ──
+    elif key_ascii == ord('h'):
+        if s.cfg.mode != "detect":
+            pass  # no-op on passthrough/patch
+        elif not s.calibration_loaded:
+            print(f"[{s.cfg.name}] H-transform unavailable — "
+                  "homography_calibration.json not found. Run calibrate_homography.py first.")
+        else:
+            s.h_active = not s.h_active
+            state = "ON" if s.h_active else "OFF"
+            if s.h_active and s.frozen and s.frozen_bbox_center is not None:
+                # Toggled ON while frozen — project existing center immediately
+                s.frozen_coord_mm = pixel_to_robot(
+                    s.frozen_bbox_center[0], s.frozen_bbox_center[1],
+                    s._H_scaled, s.cfg.zmq_width, s.cfg.zmq_height,
+                    s.actual_capture_w, s.actual_capture_h,
+                    s._calib_cam_w, s._calib_cam_h)
+                print(f"[{s.cfg.name}] H-transform {state}  "
+                      f"coord={s.frozen_coord_mm} mm")
+            elif not s.h_active and s.frozen:
+                # Toggled OFF while frozen — clear coordinate
+                s.frozen_coord_mm = None
+                print(f"[{s.cfg.name}] H-transform {state}  (coordinate cleared)")
+            else:
+                print(f"[{s.cfg.name}] H-transform {state}")
+            save_state(streams)
 
     # ── Cycle objects: [ or PageUp (detect streams only) ──
     elif key_ext in (ord('['), 0xFF55, 0x210000) or key_ascii == ord('['):
@@ -1392,8 +1603,8 @@ def dispatch_key(key_ext, key_ascii, target, streams, available_cams, no_zmq):
                 if not conflict:
                     break
             new_cap = open_camera(new_idx,
-                                 s.cfg.capture_width or 640,
-                                 s.cfg.capture_height or 480)
+                                 s.cfg.capture_width,
+                                 s.cfg.capture_height)
             if new_cap:
                 s.cap.release()
                 s.cap = new_cap
@@ -1740,19 +1951,19 @@ def main():
             cv2.rectangle(display, (0, 0), (w, 38), (20, 20, 20), -1)
             mode_label = "[ FROZEN ]  YOLO-World" if frozen else f"YOLO-World ({active_device})"
             mode_color = COLOR_FROZEN if frozen else COLOR_RUNNING
-            cv2.putText(display, mode_label, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.55, mode_color, 1)
+            cv2.putText(display, mode_label, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.63, mode_color, 1)
             cv2.putText(display, f"{fps:.1f} fps  |  r:{avg_read:.0f}  i:{avg_infer:.0f}  t:{avg_total:.0f} ms",
-                        (w - 310, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
-            cv2.putText(display, info_str, (10, 72), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (220, 220, 220), 1)
+                        (w - 310, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.57, (200, 200, 200), 1)
+            cv2.putText(display, info_str, (10, 72), cv2.FONT_HERSHEY_SIMPLEX, 0.63, (220, 220, 220), 1)
             if show_all:
-                cv2.putText(display, "[ALL]", (w - 60, 72), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 0), 1)
+                cv2.putText(display, "[ALL]", (w - 60, 72), cv2.FONT_HERSHEY_SIMPLEX, 0.57, (200, 200, 0), 1)
             if zmq_port_active is not None:
                 zmq_label = f"ZMQ:{zmq_port_active}"
-                cv2.putText(display, zmq_label, (w - 90, 72), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (100, 220, 100), 1)
+                cv2.putText(display, zmq_label, (w - 90, 72), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (100, 220, 100), 1)
             cam_str = "CAM [" + "  ".join(f">{c}<" if c == cam_idx else str(c) for c in available) + "]"
-            cv2.putText(display, cam_str, (10, h - 28), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 220, 255), 1)
+            cv2.putText(display, cam_str, (10, h - 28), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (180, 220, 255), 1)
             hint = "Q=quit  P=passthrough  F=freeze  [/]=cycle  C=cam  A=all  R=raw  S=snap  Z=pick-zone  X=excl-zone"
-            cv2.putText(display, hint, (10, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (120, 120, 120), 1)
+            cv2.putText(display, hint, (10, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.44, (120, 120, 120), 1)
 
             cv2.imshow("Annotation Stream v5", display)
 
@@ -2048,8 +2259,8 @@ def main():
                     cfg.camera_idx = available[0]  # fallback
             print(f"  Stream {cfg.id} '{cfg.name}' [{cfg.mode}]: opening camera {cfg.camera_idx}...")
             cap = open_camera(cfg.camera_idx,
-                             cfg.capture_width or 640,
-                             cfg.capture_height or 480)
+                             cfg.capture_width,
+                             cfg.capture_height)
             if cap is None:
                 print(f"  [ERROR] Cannot open camera {cfg.camera_idx}")
                 sys.exit(1)
@@ -2081,6 +2292,21 @@ def main():
             print(f"    ZMQ :{cfg.zmq_port}  name='{cfg.zmq_camera_name}'")
         streams.append(s)
 
+    # ── Load calibration (before state restore — frozen coordinate recomputation needs H) ──
+    _homography_matrix, _calib_data = load_calibration()
+    if _homography_matrix is not None:
+        _calib_cam_w = _calib_data["camera_resolution"][0]
+        _calib_cam_h = _calib_data["camera_resolution"][1]
+        for s in streams:
+            if s.cfg.mode == "detect":
+                s.calibration_loaded = True
+                s._H_scaled = _homography_matrix  # raw H at camera resolution
+                s._calib_cam_w = _calib_cam_w
+                s._calib_cam_h = _calib_cam_h
+    else:
+        _homography_matrix, _calib_data = None, None
+        _calib_cam_w, _calib_cam_h = 0, 0
+
     # ── Restore runtime state ──
     # (camera assignments were already applied during config build above)
     if state and "streams" in state:
@@ -2107,6 +2333,22 @@ def main():
                         for _ in range(BUFFER_SIZE):
                             s.buf._buf.append(s.frozen_bbox)
                     print(f"  [{s.cfg.name}] Auto-frozen: {s.frozen_bbox}  label={s.frozen_label}")
+                # Restore H-toggle state (default OFF if absent, forced OFF if no calibration)
+                s.calibration_loaded = (_homography_matrix is not None)
+                restored_h = sdata.get("h_active", False)
+                s.h_active = restored_h if s.calibration_loaded else False
+                if restored_h and not s.calibration_loaded:
+                    print(f"  [{s.cfg.name}] H-toggle was ON but calibration missing — forcing OFF")
+                if s.frozen and s.h_active and s.frozen_bbox is not None:
+                    # Recompute coordinate for restored frozen bbox
+                    x1, y1, x2, y2 = s.frozen_bbox
+                    s.frozen_bbox_center = ((x1 + x2) // 2, (y1 + y2) // 2)
+                    s.frozen_coord_mm = pixel_to_robot(
+                        s.frozen_bbox_center[0], s.frozen_bbox_center[1],
+                        s._H_scaled, s.cfg.zmq_width, s.cfg.zmq_height,
+                        s.actual_capture_w, s.actual_capture_h,
+                        s._calib_cam_w, s._calib_cam_h)
+                    print(f"  [{s.cfg.name}] Restored coordinate: {s.frozen_coord_mm} mm")
             # selected_det_idx always reset to None on restore (fixes R1-#12)
             s.selected_det_idx = None
 
